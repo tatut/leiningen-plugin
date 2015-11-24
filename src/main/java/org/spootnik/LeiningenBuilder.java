@@ -147,16 +147,17 @@ public class LeiningenBuilder extends Builder {
 		args.add("-XX:+TieredCompilation");
 		args.add("-Xbootclasspath/a:" +  descriptor.getJarPath());
 
-                // TODO: handle also spaces within the options, like '-Dvalue="some string"'
-                for(String jo : jvmOpts.split(" ")) {
-                  if(! "".equals(jo)) {
-                    args.add(jo);
-                  }
-                }
-
+		// TODO: handle also spaces within the options, like '-Dvalue="some string"'
+		if(jvmOpts != null) { // jvmOpts may be null if config was saved in previous plugin version
+			for(String jo : jvmOpts.split(" ")) {
+				if(! "".equals(jo)) {
+					args.add(jo);
+				}
+			}
+		}
 		args.add("-Dfile.encoding=UTF-8");
 		args.add("-Dmaven.wagon.http.ssl.easy=false");
-                args.add("-Dleiningen.original.pwd=" + workDir);
+		args.add("-Dleiningen.original.pwd=" + workDir);
 		args.add("-cp");
 		args.add(jarPath);
 		args.add("clojure.main");
