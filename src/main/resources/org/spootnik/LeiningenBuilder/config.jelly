@@ -11,5 +11,8 @@
     <f:entry title="JVM options" field="jvmOpts">
       <f:textbox/>
     </f:entry>
+    <f:entry title="Enable parallel lein invocations" field="parallel">
+      <f:checkbox/>
+    </f:entry>
   </f:advanced>
 </j:jelly>

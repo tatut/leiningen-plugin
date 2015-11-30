@@ -5,22 +5,41 @@ import hudson.FilePath;
 import hudson.Extension;
 import hudson.Util;
 import hudson.util.FormValidation;
+import hudson.console.ConsoleNote;
 import hudson.model.AbstractBuild;
 import hudson.model.BuildListener;
 import hudson.model.AbstractProject;
+import hudson.model.Cause;
 import hudson.tasks.Builder;
 import hudson.tasks.BuildStepDescriptor;
 import hudson.util.ArgumentListBuilder;
 import hudson.model.Result;
 import net.sf.json.JSONObject;
+
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.QueryParameter;
+
 import javax.servlet.ServletException;
+
 import java.io.IOException;
 import java.io.File;
+import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+import jenkins.util.BuildListenerAdapter;
 
 
 /**
@@ -42,86 +61,136 @@ import java.util.regex.Pattern;
  */
 public class LeiningenBuilder extends Builder {
 
-    private final String task;
-    private String subdirPath;
-    private String jvmOpts;
+	private final String task;
+	private String subdirPath;
+	private String jvmOpts;
+	private boolean parallel;
 
-
-    // Fields in config.jelly must match the parameter names in the "DataBoundConstructor"
-    @DataBoundConstructor
-    public LeiningenBuilder(String task, String subdirPath, String jvmOpts) {
-        this.task = task;
-        this.subdirPath = subdirPath;
-        this.jvmOpts = jvmOpts;
-    }
-
-    /**
-     * We'll use this from the <tt>config.jelly</tt>.
-     */
-    public String getTask() {
-        return task;
-    }
-
-    public String getSubdirPath() {
-        return subdirPath;
-    }
-
-    public String getJvmOpts() {
-        return jvmOpts;
-    }
-
-
-    @Override
-    public boolean perform(AbstractBuild build, Launcher launcher, BuildListener listener) {
-        // This is where you 'build' the project.
-        // Since this is a dummy, we just say 'hello world' and call that a build.
-
-        // This also shows how you can consult the global configuration of the builder
-
-	String output;
-	EnvVars env = null;
-	FilePath workDir = build.getModuleRoot();
-	int exitValue;
-	boolean success;
-
-	if (task == null || task.trim().equals("")) {
-		listener.fatalError("invalid task: " + task);
-                build.setResult(Result.ABORTED);
-		return false;
+	// Fields in config.jelly must match the parameter names in the "DataBoundConstructor"
+	@DataBoundConstructor
+	public LeiningenBuilder(String task, String subdirPath, String jvmOpts, boolean parallel) {
+		this.task = task;
+		this.subdirPath = subdirPath;
+		this.jvmOpts = jvmOpts;
+		this.parallel = parallel;
 	}
 
-	if (subdirPath != null && subdirPath.length() > 0) {
-		workDir = new FilePath(workDir, subdirPath);
+
+	public boolean isParallel() {
+		return parallel;
 	}
 
-	try {
-		ArgumentListBuilder leinCommand = getLeinCommand(build, launcher, listener, workDir);
-		String[] cmdarray = leinCommand.toCommandArray();
-		env = build.getEnvironment(listener);
 
-		exitValue = launcher.launch().cmds(cmdarray).envs(env).stdout(listener).pwd(workDir).join();
-
-		return (exitValue == 0);
-	} catch (IllegalArgumentException e) {
-		e.printStackTrace(listener.fatalError("leiningen failed: " + e.getMessage()));
-		build.setResult(Result.FAILURE);
-		return false;
-	} catch (IOException e) {
-		Util.displayIOException(e, listener);
-		e.printStackTrace(listener.fatalError("leiningen failed: " + e.getMessage()));
-		build.setResult(Result.FAILURE);
-		return false;
-	} catch (InterruptedException e) {
-		e.printStackTrace(listener.fatalError("leiningen failed: " + e.getMessage()));
-                build.setResult(Result.ABORTED);
-		return false;
+	/**
+	 * We'll use this from the <tt>config.jelly</tt>.
+	 */
+	public String getTask() {
+		return task;
 	}
-    }
 
-    private ArgumentListBuilder getLeinCommand(AbstractBuild build, Launcher launcher, BuildListener listener, FilePath workDir)
-	throws IllegalArgumentException, InterruptedException, IOException {
+	public String getSubdirPath() {
+		return subdirPath;
+	}
 
-	        DescriptorImpl descriptor = (DescriptorImpl) getDescriptor();
+	public String getJvmOpts() {
+		return jvmOpts;
+	}
+
+	public boolean perform(final AbstractBuild build, final Launcher launcher, final BuildListener listener) {
+
+		if(parallel) {
+			// Run lein tasks in parallel
+			// Split tasks into a sequence by semicolon
+			// For example "clean; cljsbuild once prod & compile; test & docs; uberjar" will make 4 steps:
+			// 1. run "lein clean"
+			// 2. run "lein cljsbuild once prod" and "lein compile" in parallel
+			// 3. run "lein test" and "lein docs" in parallel
+			// 4. run "lein uberjar"
+
+			final PrintStream log = listener.getLogger();
+
+			String[] sequentialTasks = this.task.split(";");
+
+			ExecutorService executor = Executors.newCachedThreadPool();
+
+			for(String task : sequentialTasks) {
+				task = task.trim();
+				log.println("Running Leiningen tasks: " + task);
+				// Fork all parallel tasks
+				List<String> parallelTasks = Arrays.asList(task.split("&"));
+
+				// Start new threads for each parallel task  
+				List<Future<Boolean>> tasks = new ArrayList<Future<Boolean>>();
+				parallelTasks.stream().forEach(t -> tasks.add(executor.submit( () -> performTask(build, launcher, listener, t))));
+	
+				// Check return values of tasks for failures, .get() will block until task is finished
+				// so this effectively waits for all tasks to complete
+				boolean fail = tasks.stream().anyMatch(f -> { 
+					try { 
+						return f.get() == false; 
+					} catch(Exception e) {
+						return true; // unable to determine status, fail
+					}});
+
+				if(fail) {
+					listener.finished(Result.FAILURE);
+					return false;
+				}
+			}
+			listener.finished(Result.SUCCESS);
+			return true;
+		} else {
+			// If not configured as parallel, retain old behaviour
+			return performTask(build,launcher,listener, this.task);
+		}
+	}
+
+	public boolean performTask(AbstractBuild build, Launcher launcher, BuildListener listener, String task) {
+
+		String output;
+		EnvVars env = null;
+		FilePath workDir = build.getModuleRoot();
+		int exitValue;
+		boolean success;
+
+		if (task == null || task.trim().equals("")) {
+			listener.fatalError("invalid task: " + task);
+			build.setResult(Result.ABORTED);
+			return false;
+		}
+
+		if (subdirPath != null && subdirPath.length() > 0) {
+			workDir = new FilePath(workDir, subdirPath);
+		}
+
+		try {
+			ArgumentListBuilder leinCommand = getLeinCommand(build, launcher, workDir, task);
+			String[] cmdarray = leinCommand.toCommandArray();
+			env = build.getEnvironment(listener);
+
+			exitValue = launcher.launch().cmds(cmdarray).envs(env).stdout(listener).pwd(workDir).join();
+
+			return (exitValue == 0);
+		} catch (IllegalArgumentException e) {
+			e.printStackTrace(listener.fatalError("leiningen failed: " + e.getMessage()));
+			build.setResult(Result.FAILURE);
+			return false;
+		} catch (IOException e) {
+			Util.displayIOException(e, listener);
+			e.printStackTrace(listener.fatalError("leiningen failed: " + e.getMessage()));
+			build.setResult(Result.FAILURE);
+			return false;
+		} catch (InterruptedException e) {
+			e.printStackTrace(listener.fatalError("leiningen failed: " + e.getMessage()));
+			build.setResult(Result.ABORTED);
+			return false;
+		}
+	}
+
+	private ArgumentListBuilder getLeinCommand(AbstractBuild build, Launcher launcher, FilePath workDir, String task)
+			throws IllegalArgumentException, InterruptedException, IOException {
+
+		DescriptorImpl descriptor = (DescriptorImpl) getDescriptor();
 		ArgumentListBuilder args = new ArgumentListBuilder();
 		String jarPath = descriptor.getJarPath();
 
@@ -174,92 +243,93 @@ public class LeiningenBuilder extends Builder {
 				args.add(matcher.group());
 		}
 		return args;
-    }
+	}
 
 
-    // Overridden for better type safety.
-    // If your plugin doesn't really define any property on Descriptor,
-    // you don't have to do this.
-    @Override
-    public DescriptorImpl getDescriptor() {
-        return (DescriptorImpl)super.getDescriptor();
-    }
+	// Overridden for better type safety.
+	// If your plugin doesn't really define any property on Descriptor,
+	// you don't have to do this.
+	@Override
+	public DescriptorImpl getDescriptor() {
+		return (DescriptorImpl)super.getDescriptor();
+	}
 
-    /**
-     * Descriptor for {@link LeiningenBuilder}. Used as a singleton.
-     * The class is marked as public so that it can be accessed from views.
-     *
-     * <p>
-     * See <tt>src/main/resources/hudson/plugins/hello_world/LeiningenBuilder/*.jelly</tt>
-     * for the actual HTML fragment for the configuration screen.
-     */
-    @Extension // This indicates to Jenkins that this is an implementation of an extension point.
-    public static final class DescriptorImpl extends BuildStepDescriptor<Builder> {
-        /**
-         * To persist global configuration information,
-         * simply store it in a field and call save().
-         *
-         * <p>
-         * If you don't want fields to be persisted, use <tt>transient</tt>.
-         */
-	private String jarPath;
 
 	/**
+	 * Descriptor for {@link LeiningenBuilder}. Used as a singleton.
+	 * The class is marked as public so that it can be accessed from views.
 	 *
-	 * Make sure configuration is read at startup
-	 *
+	 * <p>
+	 * See <tt>src/main/resources/hudson/plugins/hello_world/LeiningenBuilder/*.jelly</tt>
+	 * for the actual HTML fragment for the configuration screen.
 	 */
-	public DescriptorImpl() {
-		load();
+	@Extension // This indicates to Jenkins that this is an implementation of an extension point.
+	public static final class DescriptorImpl extends BuildStepDescriptor<Builder> {
+		/**
+		 * To persist global configuration information,
+		 * simply store it in a field and call save().
+		 *
+		 * <p>
+		 * If you don't want fields to be persisted, use <tt>transient</tt>.
+		 */
+		private String jarPath;
+
+		/**
+		 *
+		 * Make sure configuration is read at startup
+		 *
+		 */
+		public DescriptorImpl() {
+			load();
+		}
+
+		public String getJarPath() {
+			return jarPath;
+		}
+
+		/**
+		 * Performs on-the-fly validation of the form field 'name'.
+		 *
+		 * @param value
+		 *      This parameter receives the value that the user has typed.
+		 * @return
+		 *      Indicates the outcome of the validation. This is sent to the browser.
+		 */
+		public FormValidation doCheckTask(@QueryParameter String value)
+				throws IOException, ServletException {
+			if (value.length() == 0)
+				return FormValidation.error("Please provide a leiningen task command line");
+			return FormValidation.ok();
+		}
+
+		public FormValidation doCheckJarPath(@QueryParameter String value)
+				throws IOException, ServletException {
+			if (value.length() == 0)
+				return FormValidation.error("Please provide a valid leiningen JAR path");
+			return FormValidation.ok();
+		}
+
+		public boolean isApplicable(Class<? extends AbstractProject> aClass) {
+			// Indicates that this builder can be used with all kinds of project types
+			return true;
+		}
+
+		/**
+		 * This human readable name is used in the configuration screen.
+		 */
+		public String getDisplayName() {
+			return "Build project using leiningen";
+		}
+
+		@Override
+
+
+		public boolean configure(StaplerRequest req, JSONObject formData) throws FormException {
+			// To persist global configuration information,
+			// set that to properties and call save().
+			jarPath = formData.getString("jarPath");
+			save();
+			return super.configure(req,formData);
+		}
 	}
-
-	public String getJarPath() {
-		return jarPath;
-	}
-
-        /**
-         * Performs on-the-fly validation of the form field 'name'.
-         *
-         * @param value
-         *      This parameter receives the value that the user has typed.
-         * @return
-         *      Indicates the outcome of the validation. This is sent to the browser.
-         */
-        public FormValidation doCheckTask(@QueryParameter String value)
-                throws IOException, ServletException {
-            if (value.length() == 0)
-                return FormValidation.error("Please provide a leiningen task command line");
-            return FormValidation.ok();
-        }
-
-	public FormValidation doCheckJarPath(@QueryParameter String value)
-                throws IOException, ServletException {
-		if (value.length() == 0)
-			return FormValidation.error("Please provide a valid leiningen JAR path");
-		return FormValidation.ok();
-	}
-
-        public boolean isApplicable(Class<? extends AbstractProject> aClass) {
-            // Indicates that this builder can be used with all kinds of project types
-            return true;
-        }
-
-        /**
-         * This human readable name is used in the configuration screen.
-         */
-        public String getDisplayName() {
-            return "Build project using leiningen";
-        }
-
-        @Override
-
-
-        public boolean configure(StaplerRequest req, JSONObject formData) throws FormException {
-            // To persist global configuration information,
-            // set that to properties and call save().
-	    jarPath = formData.getString("jarPath");
-            save();
-            return super.configure(req,formData);
-        }
-    }
 }
