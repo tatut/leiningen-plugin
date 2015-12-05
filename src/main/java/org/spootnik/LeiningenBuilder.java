@@ -28,14 +28,18 @@ import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
@@ -96,49 +100,68 @@ public class LeiningenBuilder extends Builder {
 		return jvmOpts;
 	}
 
+	
+	Map<String,List<String>> parseLeinTasks(String tasks) {
+		HashMap<String,List<String>> taskDeps = new HashMap<>();
+		
+		Arrays.asList(tasks.split("\n")).stream().forEach( (task) -> {
+			String[] taskAndDeps = task.split(":");
+			if(taskAndDeps.length > 2) {
+				throw new IllegalArgumentException("Expected task line to be: \"task: deps\"");
+			}
+			List<String> deps = taskAndDeps.length < 2 
+					? Collections.emptyList()
+					: Arrays.asList(taskAndDeps[1].split(";"))
+						.stream().map(d -> d.trim()).collect(Collectors.toList());
+			taskDeps.put(taskAndDeps[0].trim(), deps);
+		});
+		
+		return taskDeps;
+	}
+	
+	enum Status { PENDING, RUNNING, COMPLETE, FAILED };
+	
 	public boolean perform(final AbstractBuild build, final Launcher launcher, final BuildListener listener) {
 
 		if(parallel) {
-			// Run lein tasks in parallel
-			// Split tasks into a sequence by semicolon
-			// For example "clean; cljsbuild once prod & compile; test & docs; uberjar" will make 4 steps:
-			// 1. run "lein clean"
-			// 2. run "lein cljsbuild once prod" and "lein compile" in parallel
-			// 3. run "lein test" and "lein docs" in parallel
-			// 4. run "lein uberjar"
-
+			// Run lein tasks parallel in dependency order
 			final PrintStream log = listener.getLogger();
 
-			String[] sequentialTasks = this.task.split(";");
-
+			Map<String,List<String>> taskDeps = parseLeinTasks(this.task);
+			Set<String> tasks = new HashSet<>(taskDeps.keySet());
+			Map<String,Status> taskStatus = taskDeps.keySet().stream().collect(
+					Collectors.toMap(t -> t, t -> Status.PENDING));
+					
 			ExecutorService executor = Executors.newCachedThreadPool();
 
-			for(String task : sequentialTasks) {
-				task = task.trim();
-				log.println("Running Leiningen tasks: " + task);
-				// Fork all parallel tasks
-				List<String> parallelTasks = Arrays.asList(task.split("&"));
-
-				// Start new threads for each parallel task  
-				List<Future<Boolean>> tasks = new ArrayList<Future<Boolean>>();
-				parallelTasks.stream().forEach(t -> tasks.add(executor.submit( () -> performTask(build, launcher, listener, t))));
-	
-				// Check return values of tasks for failures, .get() will block until task is finished
-				// so this effectively waits for all tasks to complete
-				boolean fail = tasks.stream().anyMatch(f -> { 
-					try { 
-						return f.get() == false; 
-					} catch(Exception e) {
-						return true; // unable to determine status, fail
-					}});
-
-				if(fail) {
-					listener.finished(Result.FAILURE);
-					return false;
-				}
+			// Loop while there are tasks that are not complete yet and we haven't failed
+			while(taskStatus.values().stream().noneMatch(s -> s == Status.FAILED) &&
+					taskStatus.values().stream().anyMatch(s -> s != Status.COMPLETE)) {
+				
+				tasks.stream()
+					// Start tasks that are PENDING and whose deps are COMPLETE
+					.filter(t -> 
+						taskStatus.get(t) == Status.PENDING &&
+						taskDeps.get(t).stream().allMatch(d -> taskStatus.get(d) == Status.COMPLETE))
+					// Fork a new lein task for each task that will be started
+					.forEach(task -> {
+						log.println("Running Leiningen tasks: " + task);
+						taskStatus.put(task, Status.RUNNING);
+						executor.submit( () -> {
+							boolean success = performTask(build, launcher, listener, task);
+							taskStatus.put(task, success ? Status.COMPLETE : Status.FAILED);
+						});
+					});
+				
+				// Sleep a short while before trying again
+				try {
+					Thread.sleep(2500);
+				} catch(InterruptedException ie) { /* don't care */ }
 			}
-			listener.finished(Result.SUCCESS);
-			return true;
+			
+			boolean success = taskStatus.values().stream().noneMatch(s -> s == Status.FAILED);
+			listener.finished(success ? Result.SUCCESS : Result.FAILURE);
+			return success;
 		} else {
 			// If not configured as parallel, retain old behaviour
 			return performTask(build,launcher,listener, this.task);
